@@ -49,6 +49,8 @@ from .pytorch import trtllm_gen_fmha_module as trtllm_gen_fmha_module
 from .pytorch import (
     gen_batch_prefill_attention_sink_module as gen_batch_prefill_attention_sink_module,
     get_batch_prefill_attention_sink_uri as get_batch_prefill_attention_sink_uri,
+    gen_trtllm_fmha_v2_module as gen_trtllm_fmha_v2_module,
+    get_trtllm_fmha_v2_module as get_trtllm_fmha_v2_module,
 )
 from .tvm import gen_batch_mla_tvm_binding as gen_batch_mla_tvm_binding
 from .tvm import (
