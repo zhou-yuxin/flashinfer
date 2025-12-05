@@ -1713,7 +1713,7 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
         jit_env.FLASHINFER_JIT_DIR / "trtllm_fmha_v2" / "generated" / kernel
         for kernel in kernels
     ]
-    binding_source_path = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_binding.cu"
+    binding_source_path = jit_env.FLASHINFER_TVM_BINDING_DIR / "trtllm_fmha_v2_binding.cu"
     source_paths = kernel_paths + [binding_source_path]
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
