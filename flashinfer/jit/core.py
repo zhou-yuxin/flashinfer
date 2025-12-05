@@ -11,6 +11,7 @@ import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 from filelock import FileLock
 
+from ..compilation_context import CompilationContext
 from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
@@ -73,6 +74,7 @@ common_nvcc_flags = [
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 
+current_compilation_context = CompilationContext()
 
 @dataclasses.dataclass
 class JitSpec:

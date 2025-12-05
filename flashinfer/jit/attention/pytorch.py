@@ -22,7 +22,7 @@ import torch
 
 from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
-from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags
+from ..core import JitSpec, gen_jit_spec, logger, sm90a_nvcc_flags, sm100a_nvcc_flags, current_compilation_context
 from ...jit.cubin_loader import get_cubin
 from ..utils import (
     dtype_map,
