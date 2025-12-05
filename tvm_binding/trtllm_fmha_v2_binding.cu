@@ -27,9 +27,11 @@
 #include <cstring>
 #include <numeric>
 
-#include "tvm_ffi_utils.h"
+#include "tvm_binding_utils.h"
 
-using tvm::ffi::Optional;
+// #include "tvm_ffi_utils.h"
+
+// using tvm::ffi::Optional;
 
 using Launch_params = bert::Fused_multihead_attention_launch_params;
 using Attention_mask_type = fmha::Attention_mask_type;
