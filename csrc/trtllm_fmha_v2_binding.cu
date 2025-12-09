@@ -27,11 +27,7 @@
 #include <cstring>
 #include <numeric>
 
-#include "tvm_binding_utils.h"
-
-// #include "tvm_ffi_utils.h"
-
-// using tvm::ffi::Optional;
+#include "pytorch_extension_utils.h"
 
 using Launch_params = bert::Fused_multihead_attention_launch_params;
 using Attention_mask_type = fmha::Attention_mask_type;
@@ -305,24 +301,24 @@ static inline void determine_launch_params(
  * @param is_e4m3 Whether the input is E4M3
  * @param is_bf16_output Whether the output is BF16
  */
-void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
-                     Optional<TensorView> maybe_lse, int64_t num_heads, int64_t head_dim,
-                     int64_t seq_len, const float scale_softmax, const float scale_bmm1,
-                     const float scale_bmm2, bool is_e4m3, bool is_bf16_output) {
-  const int batch_size = q.shape()[0];
+void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
+                     std::optional<at::Tensor> maybe_lse, int64_t num_heads, int64_t head_dim,
+                     int64_t seq_len, const double scale_softmax, const double scale_bmm1,
+                     const double scale_bmm2, bool is_e4m3, bool is_bf16_output) {
+  const int batch_size = q.size(0);//q.shape()[0];
   // q,k,v seqlen all equal
-  const int q_seqlen = q.shape()[1];
-  const int kv_seqlen = k.shape()[1];
+  const int q_seqlen = q.size(1); //q.shape()[1];
+  const int kv_seqlen = k.size(1); //k.shape()[1];
   // num_heads
-  assert(num_heads == q.shape()[2] &&
+  assert(num_heads == /*q.shape()[2]*/ q.size(2) &&
          "num_heads must be equal to the number of heads in the query tensor");
-  const int num_kv_heads = k.shape()[2];
+  const int num_kv_heads = k.size(2); //k.shape()[2];
 
   // head_dim_qk
-  assert(head_dim == q.shape()[3] &&
+  assert(head_dim == /*q.shape()[3]*/ q.size(3) &&
          "head_dim must be equal to the head dimension in the query tensor");
   // head_dim_v
-  const int head_dim_v = v.shape()[3];  // Should be 128
+  const int head_dim_v = v.size(3); //v.shape()[3];  // Should be 128
 
   Data_type data_type = is_e4m3 ? DATA_TYPE_E4M3 : DATA_TYPE_BF16;
   Data_type acc_type = DATA_TYPE_FP32;
@@ -334,7 +330,8 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   int sm = device.sm;
   cudaDeviceProp props = device.props;
 
-  cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+  // cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   Launch_params launch_params;
   determine_launch_params(launch_params, data_type, sm, q_seqlen, head_dim, attention_mask_type,
@@ -427,6 +424,10 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
+// TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
 
 }  // namespace flashinfer
+
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &flashinfer::TRTLLMFMHAv2Run);
+}
