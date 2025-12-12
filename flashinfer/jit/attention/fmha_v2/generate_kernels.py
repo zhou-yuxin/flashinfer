@@ -7,6 +7,8 @@ from .generator_utils import (
     encode_name,
     enumerate_hmma_flash_kernels,
     enumerate_qmma_flash_kernels,
+    enumerate_hgmma_flash_warpspec_kernels,
+    enumerate_qgmma_flash_warpspec_kernels,
     generate_files,
 )
 
@@ -49,6 +51,10 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
         enumerate_qmma_flash_kernels(
             specs, sm=120, dtype="e4m3_fp32", head_sizes=[192], output_dtype="bf16"
         )
+        enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16')
+        enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='bf16')
+        enumerate_qgmma_flash_warpspec_kernels(specs, sm=90, dtype='e4m3')
+        enumerate_qgmma_flash_warpspec_kernels(specs, sm=90, dtype='e4m3', output_dtype="bf16")
 
         # Expand the cartesian product of the list fields "seq_len" and "head_size".
         specs_expanded = []

@@ -329,13 +329,17 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
                           false,  // force_unroll
                           false,  // use_tma (let determine_launch_params decide)
                           false,  // force_non_flash_attention
-                          true,   // force_non_warp_specialization (for non-SM90)
+                          false,   // force_non_warp_specialization (for non-SM90)
                           false,  // force_non_granular_tiling
                           true,   // force_fp32_acc
                           props);
 
   launch_params.total_q_seqlen = q_seqlen;
   launch_params.total_kv_seqlen = kv_seqlen;
+
+  // Allocate tile id for dynamic scheduling
+  void *tile_id_counter_d = nullptr;
+  FMHA_CHECK_CUDA(cudaMalloc((void **)&tile_id_counter_d, sizeof(uint32_t)));
 
   // device memory for scale_bmm2
   void* scale_bmm2_d;
@@ -386,7 +390,8 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
              o.data_ptr(),       // o_packed_d
              nullptr,            // p_d (not storing)
              nullptr,            // s_d (not storing)
-             maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr, scale_bmm2_d,
+             maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr,
+             scale_bmm2_d,
              scale_bmm1,     // scale_bmm1
              scale_softmax,  // scale_softmax
              scale_bmm2,     // scale_bmm2
@@ -395,9 +400,14 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
              false,          // interleaved
              false,          // is_s_padded
              false);         // has_alibi
-  run_fmha_v2(params, launch_params, data_type, output_dtype, 120, stream);
+
+  params.tile_id_counter_ptr = (uint32_t *)tile_id_counter_d;
+
+  run_fmha_v2(params, launch_params, data_type, output_dtype, sm, stream);
+
   FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
   FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
+  FMHA_CHECK_CUDA(cudaFree(tile_id_counter_d));
 }
 
 // TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
