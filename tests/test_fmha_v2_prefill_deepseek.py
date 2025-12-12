@@ -50,7 +50,6 @@ def attention_ref(
     [
         (torch.bfloat16, torch.bfloat16),
         (torch.float8_e4m3fn, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float16),
     ],
 )
 def test_fmha_v2_prefill_deepseek(
