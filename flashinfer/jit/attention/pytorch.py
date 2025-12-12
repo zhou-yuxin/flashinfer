@@ -1703,16 +1703,13 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
     # Generate kernel source
     enumerate_kernels(fmha_v2_src_dir, cached_ops)
 
-    kernels = [
-        "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
-        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
-        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
-    ]
+    generated_dir = cached_ops / "generated"
+    kernel_paths = []
+    for fname in os.listdir(generated_dir):
+        fpath = generated_dir / fname
+        if os.path.isfile(fpath) and fname.startswith("fmha_v2_") and fname.endswith(".cu"):
+            kernel_paths.append(fpath)
 
-    kernel_paths = [
-        jit_env.FLASHINFER_JIT_DIR / "trtllm_fmha_v2" / "generated" / kernel
-        for kernel in kernels
-    ]
     binding_source_path = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_binding.cu"
     source_paths = kernel_paths + [binding_source_path]
 
@@ -1720,6 +1717,7 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
         supported_major_versions=[10, 11, 12]
     )
     nvcc_flags.append(f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}")
+    nvcc_flags.append(f"-I{generated_dir}")
 
     return gen_jit_spec(
         uri,

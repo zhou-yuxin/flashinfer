@@ -20,6 +20,7 @@
 #include <float.h>
 #include <fused_multihead_attention.h>
 #include <fused_multihead_attention_utils.h>
+#include <fused_multihead_attention_api.h>
 #include <math.h>
 
 #include <algorithm>
@@ -29,22 +30,9 @@
 
 #include "pytorch_extension_utils.h"
 
-using Launch_params = bert::Fused_multihead_attention_launch_params;
 using Attention_mask_type = fmha::Attention_mask_type;
 using Attention_input_layout = fmha::Attention_input_layout;
 using Kv_block_array = fmha::Kv_block_array;
-
-extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
-    const bert::Fused_multihead_attention_params_v2& params,
-    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
-
-extern void run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120_nl_tiled(
-    const bert::Fused_multihead_attention_params_v2& params,
-    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
-
-extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled(
-    const bert::Fused_multihead_attention_params_v2& params,
-    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 namespace flashinfer {
@@ -407,19 +395,7 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
              false,          // interleaved
              false,          // is_s_padded
              false);         // has_alibi
-
-  if (data_type == DATA_TYPE_E4M3 && output_dtype == DATA_TYPE_BF16) {
-    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
-        params, launch_params, stream);
-  } else if (data_type == DATA_TYPE_BF16) {
-    run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120_nl_tiled(params, launch_params,
-                                                                           stream);
-  } else if (data_type == DATA_TYPE_E4M3 && acc_type == DATA_TYPE_FP32) {
-    run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled(
-        params, launch_params, stream);
-  } else {
-    throw std::runtime_error("Unsupported data type");
-  }
+  run_fmha_v2(params, launch_params, data_type, output_dtype, 120, stream);
   FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
   FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
 }
