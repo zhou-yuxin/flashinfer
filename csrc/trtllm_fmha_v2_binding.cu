@@ -334,8 +334,9 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
                           true,   // force_fp32_acc
                           props);
 
-  launch_params.total_q_seqlen = q_seqlen;
-  launch_params.total_kv_seqlen = kv_seqlen;
+  launch_params.total_q_seqlen = q_seqlen * batch_size;
+  launch_params.total_kv_seqlen = kv_seqlen * batch_size;
+  launch_params.enable_attn_logit_softcapping = false;
 
   // Allocate tile id for dynamic scheduling
   void *tile_id_counter_d = nullptr;
