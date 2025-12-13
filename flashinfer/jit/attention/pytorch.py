@@ -1688,12 +1688,12 @@ def cudnn_fmha_gen_module():
     )
 
 
-def get_trtllm_fmha_v2_module():
-    module = gen_trtllm_fmha_v2_module().build_and_load()
+def get_trtllm_fmha_v2_module(skip_softmax_stat: bool = True):
+    module = gen_trtllm_fmha_v2_module(skip_softmax_stat).build_and_load()
     return module
 
 
-def gen_trtllm_fmha_v2_module() -> JitSpec:
+def gen_trtllm_fmha_v2_module(skip_softmax_stat: bool = True) -> JitSpec:
     uri = "trtllm_fmha_v2"
     cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
     cached_ops.mkdir(parents=True, exist_ok=True)
@@ -1718,6 +1718,8 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
     )
     nvcc_flags.append(f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}")
     nvcc_flags.append(f"-I{generated_dir}")
+    if skip_softmax_stat:
+        nvcc_flags.append("-DSKIP_SOFTMAX_STAT")
 
     return gen_jit_spec(
         uri,

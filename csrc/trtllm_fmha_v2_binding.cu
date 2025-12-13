@@ -292,7 +292,8 @@ static inline void determine_launch_params(
 void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
                      std::optional<at::Tensor> maybe_lse, int64_t num_heads, int64_t head_dim,
                      int64_t seq_len, const double scale_softmax, const double scale_bmm1,
-                     const double scale_bmm2, bool is_e4m3, bool is_bf16_output) {
+                     const double scale_bmm2, bool is_e4m3, bool is_bf16_output,
+                     const double skip_softmax_threshold_scale_factor) {
   const int batch_size = q.size(0);//q.shape()[0];
   // q,k,v seqlen all equal
   const int q_seqlen = q.size(1); //q.shape()[1];
@@ -403,12 +404,33 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
              false);         // has_alibi
 
   params.tile_id_counter_ptr = (uint32_t *)tile_id_counter_d;
+  params.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor;
+#ifdef SKIP_SOFTMAX_STAT
+  uint32_t *skip_softmax_stat_d;
+  FMHA_CHECK_CUDA(cudaMalloc(&skip_softmax_stat_d, sizeof(uint32_t) * 2));
+  FMHA_CHECK_CUDA(cudaMemset(skip_softmax_stat_d, 0, sizeof(uint32_t) * 2));
+  params.skip_softmax_total_blocks = skip_softmax_stat_d;
+  params.skip_softmax_skipped_blocks = skip_softmax_stat_d + 1;
+#endif
 
   run_fmha_v2(params, launch_params, data_type, output_dtype, sm, stream);
+
+  #ifdef SKIP_SOFTMAX_STAT
+  uint32_t skip_softmax_stat[2];
+  FMHA_CHECK_CUDA(cudaMemcpy(skip_softmax_stat, skip_softmax_stat_d,
+    sizeof(uint32_t) * 2, cudaMemcpyDeviceToHost));
+  printf("Skip-Softmax: Sparsity(@scale = %.2f) = %u/%u = %.2f%%\n",
+          skip_softmax_threshold_scale_factor,
+          skip_softmax_stat[1], skip_softmax_stat[0],
+          100.f * skip_softmax_stat[1] / skip_softmax_stat[0]);
+#endif
 
   FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
   FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
   FMHA_CHECK_CUDA(cudaFree(tile_id_counter_d));
+#ifdef SKIP_SOFTMAX_STAT
+  FMHA_CHECK_CUDA(cudaFree(skip_softmax_stat_d));
+#endif
 }
 
 // TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);

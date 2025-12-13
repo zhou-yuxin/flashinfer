@@ -3,7 +3,7 @@ import torch
 import math
 
 
-from flashinfer.prefill import fmha_v2_prefill_deepseek
+from flashinfer.jit import get_trtllm_fmha_v2_module
 from utils_fp8 import to_float8
 
 
@@ -40,11 +40,18 @@ def attention_ref(
     return o_ref, lse_ref
 
 
+@pytest.fixture(scope="module")
+def fmha_v2_module():
+    print("\nJit for fmha_v2...")
+    module = get_trtllm_fmha_v2_module(True)    # enable statistics of skip-softmax
+    yield module
+
+
 @pytest.mark.parametrize("batch_size", [1, 3, 8])
 @pytest.mark.parametrize("num_heads", [1, 3, 8])
 @pytest.mark.parametrize("head_dim_qk", [192])
 @pytest.mark.parametrize("head_dim_v", [128])
-@pytest.mark.parametrize("seq_len", [1024, 4096, 8192])
+@pytest.mark.parametrize("seq_len", [1024, 4096, 8192, 16384])
 @pytest.mark.parametrize(
     "qkv_dtype,o_dtype",
     [
@@ -52,8 +59,10 @@ def attention_ref(
         (torch.float8_e4m3fn, torch.bfloat16),
     ],
 )
-def test_fmha_v2_prefill_deepseek(
-    batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype
+@pytest.mark.parametrize("skip_softmax_threshold_scale_factor", [0, 10, 100, 1000])
+def test_fmha_v2_prefill_deepseek(fmha_v2_module,
+    batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype,
+    skip_softmax_threshold_scale_factor,
 ):
     torch.manual_seed(42)
 
@@ -119,20 +128,13 @@ def test_fmha_v2_prefill_deepseek(
     scale_bmm1 = q_scale * k_scale * sm_scale
     scale_bmm2 = v_scale
     scale_softmax = 1.0 if qkv_dtype == torch.float8_e4m3fn else 0.0
-    out, lse = fmha_v2_prefill_deepseek(
-        q,
-        k,
-        v,
-        o,
-        num_heads,
-        head_dim_qk,
-        seq_len,
-        scale_softmax=scale_softmax,
-        scale_bmm1=scale_bmm1,
-        scale_bmm2=scale_bmm2,
-        return_lse=True,
-        lse=lse,
-    )
+    is_e4m3 = qkv_dtype == torch.float8_e4m3fn
+    is_bf16_output = o_dtype == torch.bfloat16
+
+    fmha_v2_module.run(q, k, v, o, lse, num_heads, head_dim_qk, 
+        seq_len, scale_softmax, scale_bmm1, scale_bmm2, is_e4m3, is_bf16_output,
+        skip_softmax_threshold_scale_factor)
+    
     # implementation gives [max(s_i), sum(exp(s_i - max(s_i)))], compute lse from this
     if qkv_dtype == torch.float8_e4m3fn:
         # For E4M3 the softmax is scaled by 256 (the largest power-of-2 below E4M3_MAX=448.0)
@@ -156,16 +158,13 @@ def test_fmha_v2_prefill_deepseek(
 
     if q.dtype == torch.float8_e4m3fn and o.dtype == torch.bfloat16:
         rtol, atol = 4e-2, 6e-2
-        torch.testing.assert_close(out, out_ref.to(o.dtype), rtol=rtol, atol=atol)
+        torch.testing.assert_close(o, out_ref.to(o.dtype), rtol=rtol, atol=atol)
     elif q.dtype == torch.bfloat16 and o.dtype == torch.bfloat16:
         rtol, atol = 1e-2, 1e-2
-        torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
+        torch.testing.assert_close(o, out_ref, rtol=rtol, atol=atol)
     else:
         rtol, atol = 1e-2, 1e-3
 
-    print("lse", lse)
-    print("ref", lse_ref)
-
-    # fix me (yuxin): Hopper fp8 get wrong lse
+    # fix me (yuxin): Hopper fp8 get wrong LSE
     if q.dtype != torch.float8_e4m3fn:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
