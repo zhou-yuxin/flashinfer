@@ -96,7 +96,8 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
                 and kspec.version == 2
                 and not kspec.cross_mha
                 and kspec.flash_attention
-                and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
+                # Now we only support SEPARATE_Q_K_V in flashinfer
+                and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
                 or (
                     kspec.sm == 90
                     and kspec.dtype in ["fp16", "bf16", "fp16_fp32"]

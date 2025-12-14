@@ -2598,7 +2598,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
         return call_stmt
 
     calls_v2 = [
-        gen_call(kspec, lname)
+        gen_call(kspec, f"printf(\"=====call {lname}\\n\");\n{lname}")
         for kspec, fname, lname, kname in specs_names
         if kspec.version == 2 and kspec.cross_mha == 0
     ]
@@ -2762,6 +2762,18 @@ const bool  use_tiled            = launch_params.use_granular_tiling;
 
 {calls_v2}
 else {{
+    printf("=======Unsupported config: s=%lu, b=%lu, h=%lu, d=%lu, dv=%lu"
+        " ,sage_block_size=(%lu, %lu, %lu), interleaved=%d, force_unroll=%d"
+        ", ignore_b1opt=%d, force_fp32_acc=%d, warp_specialization=%d"
+        ", use_tma=%d, use_flash_attention=%d, enable_attn_logit_softcapping=%d"
+        ", attention_input_layout=%d, use_tiled=%d, has_alibi=%d"
+        ", softmax_stats_ptr=%p, use_int8_scale_max=%d\\n",
+        s, b, h, d, dv, sage_block_size_q, sage_block_size_k, sage_block_size_v,
+        interleaved, force_unroll, ignore_b1opt, force_fp32_acc, warp_specialization,
+        use_tma, use_flash_attention, enable_attn_logit_softcapping,
+        attention_input_layout, use_tiled, params.has_alibi, params.softmax_stats_ptr,
+        params.use_int8_scale_max);
+    exit(1);
     assert(false && "Unsupported config.");
 }}
 
