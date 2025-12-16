@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import os
 from typing import List
 
@@ -1688,6 +1689,7 @@ def cudnn_fmha_gen_module():
     )
 
 
+@functools.cache
 def get_trtllm_fmha_v2_module(skip_softmax_stat: bool = True):
     module = gen_trtllm_fmha_v2_module(skip_softmax_stat).build_and_load()
     return module

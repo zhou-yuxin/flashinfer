@@ -29,6 +29,7 @@ from .jit import (
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
+    get_trtllm_fmha_v2_module,
     setup_cubin_loader,
     trtllm_gen_fmha_module,
 )
@@ -3445,3 +3446,90 @@ def trtllm_batch_context_with_kv_cache(
         if out_dtype != "nvfp4"
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
+
+
+def fmha_v2_prefill_deepseek(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float] = None,
+    scale_bmm2: Optional[float] = None,
+    skip_softmax_threshold_scale_factor: float = 0.0,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    FMHA v2 prefill for DeepSeek with skip-softmax optimization.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    key : torch.Tensor
+        key tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    value : torch.Tensor
+        value tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    out : torch.Tensor
+        output tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    num_heads : int
+        number of heads
+    head_dim : int
+        head dimension
+    seq_len : int
+        sequence length
+    scale_softmax : float
+        scale for softmax
+    scale_bmm1 : Optional[float]
+        scale for bmm1
+    scale_bmm2 : Optional[float]
+        scale for bmm2
+    skip_softmax_threshold_scale_factor : float
+        threshold scale factor for skip-softmax optimization.
+        0 means disabled, larger values mean more aggressive skipping.
+        actual_threshold = skip_softmax_threshold_scale_factor / seq_len
+    return_lse : bool
+        whether to return the log-sum-exp of attention output
+    lse : Optional[torch.Tensor]
+        log-sum-exp of attention output
+
+    Returns
+    -------
+    out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or Tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors,
+        the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
+    """
+    module = get_trtllm_fmha_v2_module(skip_softmax_stat=True)
+    is_e4m3 = query.dtype == torch.float8_e4m3fn
+    is_bf16_output = out.dtype == torch.bfloat16
+    scale_softmax = (
+        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
+    )
+    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
+    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
+    module.run(
+        query,
+        key,
+        value,
+        out,
+        lse,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        is_e4m3,
+        is_bf16_output,
+        skip_softmax_threshold_scale_factor,
+    )
+    if return_lse:
+        return out, lse
+    else:
+        return out

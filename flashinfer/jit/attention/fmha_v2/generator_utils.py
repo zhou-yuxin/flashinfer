@@ -9,10 +9,28 @@
 # its affiliates is strictly prohibited.
 
 import os
+import pathlib
 import subprocess
 from collections import namedtuple
 from enum import IntEnum
 from itertools import product
+
+
+def _write_if_different(path: str, content: str) -> None:
+    """Write content to file only if it differs from existing content.
+
+    This prevents unnecessary file timestamp updates which would trigger
+    ninja to rebuild unchanged files.
+    """
+    path_obj = pathlib.Path(path)
+    if path_obj.exists():
+        with open(path_obj, "r") as f:
+            if f.read() == content:
+                return
+    else:
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+    with open(path_obj, "w") as f:
+        f.write(content)
 
 sm2name = {
     70: "volta",
@@ -3682,30 +3700,24 @@ def generate_files(specs_names):
         # HACK: do not overwrite kernel file in case of collision; kernel selection logic can still be flaky
         # TODO: allow profiling multiple kernel implementations satisfying the given problem size
         if path not in kfiles:
-            with open(path, "w") as f:
-                f.write(code)
+            _write_if_different(path, code)
         kfiles.append(path)
 
     api_code = get_api_code(valid_specs_names).replace(
         "__guard_fmhca_placeholder__", "false"
     )
-    with open("./generated/fused_multihead_attention_api.h", "w") as f:
-        f.write(api_code)
+    _write_if_different("./generated/fused_multihead_attention_api.h", api_code)
 
     api_code = get_api_code(valid_specs_names).replace(
         "__guard_fmhca_placeholder__", "true"
     )
-    with open("./generated/fused_multihead_cross_attention_api.h", "w") as f:
-        f.write(api_code)
+    _write_if_different("./generated/fused_multihead_cross_attention_api.h", api_code)
 
     mk_code = get_makefile_code(valid_specs_names)
-
-    with open("./generated/makefile", "w") as f:
-        f.write(mk_code)
+    _write_if_different("./generated/makefile", mk_code)
 
     print_kernel_traits_code = get_kernel_traits_code(valid_specs_names)
-    with open("./generated/print_kernel_traits.cu", "w") as f:
-        f.write(print_kernel_traits_code)
+    _write_if_different("./generated/print_kernel_traits.cu", print_kernel_traits_code)
 
     # Make sure we have a bin directory.
     if not os.path.exists("bin"):

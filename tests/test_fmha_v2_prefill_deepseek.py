@@ -4,6 +4,7 @@ import math
 
 
 from flashinfer.jit import get_trtllm_fmha_v2_module
+from flashinfer.prefill import fmha_v2_prefill_deepseek
 from utils_fp8 import to_float8
 
 
@@ -40,13 +41,6 @@ def attention_ref(
     return o_ref, lse_ref
 
 
-@pytest.fixture(scope="module")
-def fmha_v2_module():
-    print("\nJit for fmha_v2...")
-    module = get_trtllm_fmha_v2_module(True)    # enable statistics of skip-softmax
-    yield module
-
-
 @pytest.mark.parametrize("batch_size", [1, 3, 8])
 @pytest.mark.parametrize("num_heads", [1, 3, 8])
 @pytest.mark.parametrize(
@@ -68,7 +62,7 @@ def fmha_v2_module():
     ],
 )
 @pytest.mark.parametrize("skip_softmax_threshold_scale_factor", [0, 10, 100, 1000, 5000])
-def test_fmha_v2_prefill_deepseek(fmha_v2_module,
+def test_fmha_v2_prefill_deepseek_api(
     batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype,
     skip_softmax_threshold_scale_factor,
 ):
@@ -140,17 +134,25 @@ def test_fmha_v2_prefill_deepseek(fmha_v2_module,
     scale_bmm1 = q_scale * k_scale * sm_scale
     scale_bmm2 = v_scale
     scale_softmax = 1.0 if qkv_dtype == torch.float8_e4m3fn else 0.0
-    is_e4m3 = qkv_dtype == torch.float8_e4m3fn
-    is_bf16_output = o_dtype == torch.bfloat16
 
-    # Two reason to set lse = None:
+    # Two reasons to set lse = None:
     #  1. fmha_v2 by default doesn't generate kernel with 
     #     `return_softmax and input_layout != InputLayout.CONTIGUOUS_Q_KV`,
     #     see flashinfer/jit/attention/fmha_v2/generator_utils.py.
     #  2. Hopper fp8 kernel get wrong LSE (may be a bug, will fix later).
-    fmha_v2_module.run(q, k, v, o, None, num_heads, head_dim_qk, 
-        seq_len, scale_softmax, scale_bmm1, scale_bmm2, is_e4m3, is_bf16_output,
-        skip_softmax_threshold_scale_factor)
+
+    fmha_v2_prefill_deepseek(
+        q, k, v, o,
+        num_heads=num_heads,
+        head_dim=head_dim_qk,
+        seq_len=seq_len,
+        scale_softmax=scale_softmax,
+        scale_bmm1=scale_bmm1,
+        scale_bmm2=scale_bmm2,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        return_lse=False,
+        lse=None,
+    )
     
     # implementation gives [max(s_i), sum(exp(s_i - max(s_i)))], compute lse from this
     if qkv_dtype == torch.float8_e4m3fn:
