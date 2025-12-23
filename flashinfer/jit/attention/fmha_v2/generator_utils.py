@@ -631,9 +631,22 @@ void {launcher_name}(
 
 void {launcher_name}_get_max_heads_per_wave(int *heads_per_wave) {{
 #if {use_multi_cta} // use_multi_cta
-    // Determine the number of SMs and CTAs.
+    // Cache heads_per_wave per device to avoid repeated cudaGetDeviceProperties calls.
+    // Using a simple array indexed by device ID (supports up to 16 GPUs).
+    constexpr int MAX_DEVICES = 16;
+    static int cached_heads_per_wave[MAX_DEVICES] = {{-1, -1, -1, -1, -1, -1, -1, -1,
+                                                      -1, -1, -1, -1, -1, -1, -1, -1}};
+
     int dev;
     cudaGetDevice(&dev);
+
+    // Check if we have a cached value for this device.
+    if (dev < MAX_DEVICES && cached_heads_per_wave[dev] >= 0) {{
+        *heads_per_wave = cached_heads_per_wave[dev];
+        return;
+    }}
+
+    // First call for this device: compute and cache the result.
     cudaDeviceProp props;
     FMHA_CHECK_CUDA(cudaGetDeviceProperties(&props, dev));
 
@@ -646,7 +659,14 @@ void {launcher_name}_get_max_heads_per_wave(int *heads_per_wave) {{
                                                             smem_size));
 
     // The number of heads per wave.
-    *heads_per_wave = props.multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_HEAD;
+    int result = props.multiProcessorCount * ctas_per_sm / Kernel_traits::CTAS_PER_HEAD;
+
+    // Cache the result for this device.
+    if (dev < MAX_DEVICES) {{
+        cached_heads_per_wave[dev] = result;
+    }}
+
+    *heads_per_wave = result;
 #else // use_multi_cta
     *heads_per_wave = 0;
 #endif // use_multi_cta

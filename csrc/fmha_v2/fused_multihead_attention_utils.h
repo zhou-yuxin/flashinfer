@@ -707,8 +707,29 @@ void x_vec32(bool const to, T* src_dst, int h, int total, int mats, int d = 64) 
 
 struct CudaDevice {
   CudaDevice() {
-    FMHA_CHECK_CUDA(cudaGetDeviceProperties(&props, 0));
-    sm = props.major * 10 + props.minor;
+    // Get current device ID
+    int dev;
+    FMHA_CHECK_CUDA(cudaGetDevice(&dev));
+
+    // Use cached device properties to avoid repeated cudaGetDeviceProperties calls
+    static constexpr int MAX_DEVICES = 16;
+    static cudaDeviceProp cached_props[MAX_DEVICES];
+    static int cached_sm[MAX_DEVICES] = {-1, -1, -1, -1, -1, -1, -1, -1,
+                                         -1, -1, -1, -1, -1, -1, -1, -1};
+
+    if (dev < MAX_DEVICES && cached_sm[dev] >= 0) {
+      // Use cached values
+      props = cached_props[dev];
+      sm = cached_sm[dev];
+    } else {
+      // First call for this device: query and cache
+      FMHA_CHECK_CUDA(cudaGetDeviceProperties(&props, dev));
+      sm = props.major * 10 + props.minor;
+      if (dev < MAX_DEVICES) {
+        cached_props[dev] = props;
+        cached_sm[dev] = sm;
+      }
+    }
   }
 
   ~CudaDevice() {
