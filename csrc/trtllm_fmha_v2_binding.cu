@@ -195,8 +195,15 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
   params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d);
   params.softcapping_scale_bmm1 = softcapping_scale_bmm1;
 
-  FMHA_CHECK_CUDA(cudaMemcpy(params.scale_bmm2_d, &params.scale_bmm2, sizeof(uint32_t),
-                             cudaMemcpyHostToDevice));
+  // Cache scale_bmm2 to avoid repeated cudaMemcpy when value unchanged
+  static uint32_t cached_scale_bmm2 = 0;
+  static bool scale_bmm2_initialized = false;
+  if (!scale_bmm2_initialized || cached_scale_bmm2 != params.scale_bmm2) {
+    FMHA_CHECK_CUDA(cudaMemcpy(params.scale_bmm2_d, &params.scale_bmm2, sizeof(uint32_t),
+                               cudaMemcpyHostToDevice));
+    cached_scale_bmm2 = params.scale_bmm2;
+    scale_bmm2_initialized = true;
+  }
 
   // attention type, h_kv < h if MQA or GQA
   params.h_kv = h_kv;
@@ -288,26 +295,48 @@ static inline void determine_launch_params(
  * @param scale_bmm2 Scale factor for the second GEMM
  * @param is_e4m3 Whether the input is E4M3
  * @param is_bf16_output Whether the output is BF16
+ * @param maybe_cu_seqlens Optional cumulative sequence lengths for varlen mode [batch_size + 1]
+ *
+ * Supports two modes:
+ * - Padded mode (maybe_cu_seqlens is None): q/k/v shape [batch, seq_len, heads, dim]
+ * - Varlen mode (maybe_cu_seqlens provided): q/k/v shape [total_tokens, heads, dim]
  */
 void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
                      std::optional<at::Tensor> maybe_lse, int64_t num_heads, int64_t head_dim,
                      int64_t seq_len, const double scale_softmax, const double scale_bmm1,
                      const double scale_bmm2, bool is_e4m3, bool is_bf16_output,
-                     const double skip_softmax_threshold_scale_factor) {
-  const int batch_size = q.size(0);//q.shape()[0];
-  // q,k,v seqlen all equal
-  const int q_seqlen = q.size(1); //q.shape()[1];
-  const int kv_seqlen = k.size(1); //k.shape()[1];
-  // num_heads
-  assert(num_heads == /*q.shape()[2]*/ q.size(2) &&
-         "num_heads must be equal to the number of heads in the query tensor");
-  const int num_kv_heads = k.size(2); //k.shape()[2];
+                     const double skip_softmax_threshold_scale_factor,
+                     std::optional<at::Tensor> maybe_cu_seqlens = std::nullopt) {
+  // Determine if we're in varlen mode
+  const bool is_varlen = maybe_cu_seqlens.has_value();
 
-  // head_dim_qk
-  assert(head_dim == /*q.shape()[3]*/ q.size(3) &&
-         "head_dim must be equal to the head dimension in the query tensor");
-  // head_dim_v
-  const int head_dim_v = v.size(3); //v.shape()[3];  // Should be 128
+  int batch_size, q_seqlen, kv_seqlen, total_tokens, num_kv_heads, head_dim_v;
+
+  if (is_varlen) {
+    // Varlen mode: q/k/v shape [total_tokens, num_heads, head_dim]
+    batch_size = maybe_cu_seqlens.value().size(0) - 1;
+    total_tokens = q.size(0);
+    q_seqlen = seq_len;  // max_seqlen passed as seq_len parameter
+    kv_seqlen = seq_len;
+    assert(num_heads == q.size(1) &&
+           "num_heads must be equal to the number of heads in the query tensor");
+    num_kv_heads = k.size(1);
+    assert(head_dim == q.size(2) &&
+           "head_dim must be equal to the head dimension in the query tensor");
+    head_dim_v = v.size(2);
+  } else {
+    // Padded mode: q/k/v shape [batch_size, seq_len, num_heads, head_dim]
+    batch_size = q.size(0);
+    q_seqlen = q.size(1);
+    kv_seqlen = k.size(1);
+    total_tokens = q_seqlen * batch_size;
+    assert(num_heads == q.size(2) &&
+           "num_heads must be equal to the number of heads in the query tensor");
+    num_kv_heads = k.size(2);
+    assert(head_dim == q.size(3) &&
+           "head_dim must be equal to the head dimension in the query tensor");
+    head_dim_v = v.size(3);
+  }
 
   Data_type data_type = is_e4m3 ? DATA_TYPE_E4M3 : DATA_TYPE_BF16;
   Data_type acc_type = DATA_TYPE_FP32;
@@ -335,31 +364,60 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
                           true,   // force_fp32_acc
                           props);
 
-  launch_params.total_q_seqlen = q_seqlen * batch_size;
-  launch_params.total_kv_seqlen = kv_seqlen * batch_size;
+  launch_params.total_q_seqlen = total_tokens;
+  launch_params.total_kv_seqlen = total_tokens;
   launch_params.enable_attn_logit_softcapping = false;
 
-  // Allocate tile id for dynamic scheduling
-  void *tile_id_counter_d = nullptr;
-  FMHA_CHECK_CUDA(cudaMalloc((void **)&tile_id_counter_d, sizeof(uint32_t)));
+  // Static buffers for small fixed-size allocations to avoid repeated cudaMalloc/cudaFree.
+  // These are allocated once and reused across all calls.
+  static void* tile_id_counter_d = nullptr;
+  static void* scale_bmm2_d = nullptr;
+  static bool static_buffers_initialized = false;
 
-  // device memory for scale_bmm2
-  void* scale_bmm2_d;
-  FMHA_CHECK_CUDA(cudaMalloc(&scale_bmm2_d, sizeof(uint32_t)));
-
-  // - Cumulative sequence lengths
-  std::vector<uint32_t> cu_seqlens(batch_size + 1);
-  for (int i = 0; i <= batch_size; i++) {
-    cu_seqlens[i] = i * q_seqlen;
+  if (!static_buffers_initialized) {
+    FMHA_CHECK_CUDA(cudaMalloc(&tile_id_counter_d, sizeof(uint32_t)));
+    FMHA_CHECK_CUDA(cudaMalloc(&scale_bmm2_d, sizeof(uint32_t)));
+    static_buffers_initialized = true;
   }
+
+  // Reset tile_id_counter to 0 for each call (kernel increments it)
+  FMHA_CHECK_CUDA(cudaMemsetAsync(tile_id_counter_d, 0, sizeof(uint32_t), stream));
+
+  // Handle cumulative sequence lengths
   void* cu_seqlens_d;
-  FMHA_CHECK_CUDA(cudaMalloc(&cu_seqlens_d, sizeof(uint32_t) * cu_seqlens.size()));
-  FMHA_CHECK_CUDA(cudaMemcpy(cu_seqlens_d, cu_seqlens.data(), sizeof(uint32_t) * cu_seqlens.size(),
-                             cudaMemcpyHostToDevice));
-  // LSE buffer has shape [batch_size, seq_len, num_heads, 2] for (max, lse)
+  if (is_varlen) {
+    // Varlen mode: use provided cu_seqlens directly
+    cu_seqlens_d = maybe_cu_seqlens.value().data_ptr();
+  } else {
+    // Padded mode: cache cu_seqlens_d to avoid repeated cudaMalloc/cudaMemcpy
+    // Only reallocate when batch_size or seq_len changes
+    static void* cached_cu_seqlens_d = nullptr;
+    static int cached_batch_size = -1;
+    static int cached_seqlen = -1;
+
+    if (cached_batch_size != batch_size || cached_seqlen != q_seqlen) {
+      // Need to reallocate or update
+      if (cached_cu_seqlens_d != nullptr) {
+        FMHA_CHECK_CUDA(cudaFree(cached_cu_seqlens_d));
+      }
+
+      std::vector<uint32_t> cu_seqlens(batch_size + 1);
+      for (int i = 0; i <= batch_size; i++) {
+        cu_seqlens[i] = i * q_seqlen;
+      }
+      FMHA_CHECK_CUDA(cudaMalloc(&cached_cu_seqlens_d, sizeof(uint32_t) * cu_seqlens.size()));
+      FMHA_CHECK_CUDA(cudaMemcpy(cached_cu_seqlens_d, cu_seqlens.data(),
+                                 sizeof(uint32_t) * cu_seqlens.size(), cudaMemcpyHostToDevice));
+
+      cached_batch_size = batch_size;
+      cached_seqlen = q_seqlen;
+    }
+    cu_seqlens_d = cached_cu_seqlens_d;
+  }
+  // LSE buffer: [total_tokens, num_heads, 2] for varlen, [batch, seq_len, num_heads, 2] for padded
   if (maybe_lse.has_value()) {
     FMHA_CHECK_CUDA(cudaMemset(maybe_lse.value().data_ptr(), 0,
-                               sizeof(float) * batch_size * q_seqlen * num_heads * 2));
+                               sizeof(float) * total_tokens * num_heads * 2));
   }
 
   bert::Fused_multihead_attention_params_v2 params;
@@ -372,7 +430,7 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
              num_kv_heads,       // h_kv
              head_dim,           // d
              head_dim_v,         // dv
-             cu_seqlens.back(),  // total tokens
+             total_tokens,       // total tokens
              1,                  // num_grouped_heads (not used for regular attention)
              INT_MAX,            // sliding_window_size (disabled)
              0,                  // chunked_attention_size (disabled)
@@ -400,22 +458,28 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
              0.0f,           // softcapping_scale_bmm1 (disabled)
              false,          // use_int8_scale_max
              false,          // interleaved
-             false,          // is_s_padded
+             !is_varlen,     // is_s_padded (true for padded mode, false for varlen)
              false);         // has_alibi
 
   params.tile_id_counter_ptr = (uint32_t *)tile_id_counter_d;
   params.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor;
 #ifdef SKIP_SOFTMAX_STAT
-  uint32_t *skip_softmax_stat_d;
-  FMHA_CHECK_CUDA(cudaMalloc(&skip_softmax_stat_d, sizeof(uint32_t) * 2));
-  FMHA_CHECK_CUDA(cudaMemset(skip_softmax_stat_d, 0, sizeof(uint32_t) * 2));
+  // Static buffer for skip_softmax statistics
+  static uint32_t* skip_softmax_stat_d = nullptr;
+  static bool skip_softmax_stat_initialized = false;
+  if (!skip_softmax_stat_initialized) {
+    FMHA_CHECK_CUDA(cudaMalloc(&skip_softmax_stat_d, sizeof(uint32_t) * 2));
+    skip_softmax_stat_initialized = true;
+  }
+  // Reset statistics for each call
+  FMHA_CHECK_CUDA(cudaMemsetAsync(skip_softmax_stat_d, 0, sizeof(uint32_t) * 2, stream));
   params.skip_softmax_total_blocks = skip_softmax_stat_d;
   params.skip_softmax_skipped_blocks = skip_softmax_stat_d + 1;
 #endif
 
   run_fmha_v2(params, launch_params, data_type, output_dtype, sm, stream);
 
-  #ifdef SKIP_SOFTMAX_STAT
+#ifdef SKIP_SOFTMAX_STAT
   uint32_t skip_softmax_stat[2];
   FMHA_CHECK_CUDA(cudaMemcpy(skip_softmax_stat, skip_softmax_stat_d,
     sizeof(uint32_t) * 2, cudaMemcpyDeviceToHost));
@@ -425,12 +489,6 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
           100.f * skip_softmax_stat[1] / skip_softmax_stat[0]);
 #endif
 
-  FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
-  FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
-  FMHA_CHECK_CUDA(cudaFree(tile_id_counter_d));
-#ifdef SKIP_SOFTMAX_STAT
-  FMHA_CHECK_CUDA(cudaFree(skip_softmax_stat_d));
-#endif
 }
 
 // TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);

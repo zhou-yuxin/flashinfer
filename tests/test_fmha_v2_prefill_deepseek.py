@@ -145,13 +145,14 @@ def test_fmha_v2_prefill_deepseek_api(
         q, k, v, o,
         num_heads=num_heads,
         head_dim=head_dim_qk,
-        seq_len=seq_len,
+        max_seqlen=seq_len,
         scale_softmax=scale_softmax,
         scale_bmm1=scale_bmm1,
         scale_bmm2=scale_bmm2,
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         return_lse=False,
         lse=None,
+        skip_softmax_stat=True,
     )
     
     # implementation gives [max(s_i), sum(exp(s_i - max(s_i)))], compute lse from this
@@ -185,3 +186,104 @@ def test_fmha_v2_prefill_deepseek_api(
         rtol, atol = 1e-2, 1e-3
 
     # torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
+
+
+def attention_ref_single(
+    q: torch.Tensor,  # [seq_len, num_heads, head_dim]
+    k: torch.Tensor,  # [seq_len, num_heads, head_dim]
+    v: torch.Tensor,  # [seq_len, num_heads, head_dim_v]
+    causal: bool,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Reference attention for a single sequence (varlen mode)."""
+    seq_len = q.shape[0]
+    num_heads = q.shape[1]
+
+    # [seq_len, num_heads, head_dim] -> [num_heads, seq_len, head_dim]
+    q = q.transpose(0, 1).float()
+    k = k.transpose(0, 1).float()
+    v = v.transpose(0, 1).float()
+
+    # [num_heads, seq_len, seq_len]
+    logits = torch.einsum("hmd,hnd->hmn", q, k) * sm_scale
+
+    if causal:
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
+        logits = logits.masked_fill(mask.unsqueeze(0), float("-inf"))
+
+    p = torch.softmax(logits, dim=-1)
+    # [num_heads, seq_len, head_dim_v] -> [seq_len, num_heads, head_dim_v]
+    o = torch.einsum("hmn,hnd->hmd", p, v).transpose(0, 1)
+    return o
+
+
+@pytest.mark.parametrize("num_heads", [1, 4, 8])
+@pytest.mark.parametrize("head_dim_qk,head_dim_v", [(64, 64), (128, 128)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [1024, 2048, 4096],        # 3 sequences with different lengths
+        [1024, 2048, 4096, 8192],  # 4 sequences
+        [4096, 2048, 1024],        # decreasing lengths
+        [1000, 2000, 3000, 4000],  # non-power-of-2 lengths
+    ],
+)
+@pytest.mark.parametrize("skip_softmax_threshold_scale_factor", [0, 10, 100, 1000, 5000])
+def test_fmha_v2_prefill_deepseek_varlen(
+    num_heads, head_dim_qk, head_dim_v, seq_lens, skip_softmax_threshold_scale_factor
+):
+    """Test with truly variable length sequences (different lengths per batch)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    batch_size = len(seq_lens)
+    total_tokens = sum(seq_lens)
+    max_seqlen = max(seq_lens)
+
+    # Create cu_seqlens: [0, len0, len0+len1, len0+len1+len2, ...]
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    for i, sl in enumerate(seq_lens):
+        cu_seqlens[i + 1] = cu_seqlens[i] + sl
+
+    # Create packed tensors [total_tokens, num_heads, head_dim]
+    q = torch.randn(total_tokens, num_heads, head_dim_qk, dtype=dtype, device=device)
+    k = torch.randn(total_tokens, num_heads, head_dim_qk, dtype=dtype, device=device)
+    v = torch.randn(total_tokens, num_heads, head_dim_v, dtype=dtype, device=device)
+    o = torch.zeros(total_tokens, num_heads, head_dim_v, dtype=dtype, device=device)
+
+    sm_scale = 1.0 / math.sqrt(head_dim_qk)
+
+    # Run fmha_v2_prefill_deepseek in varlen mode
+    fmha_v2_prefill_deepseek(
+        q, k, v, o,
+        num_heads=num_heads,
+        head_dim=head_dim_qk,
+        max_seqlen=max_seqlen,
+        scale_softmax=0.0,
+        scale_bmm1=sm_scale,
+        scale_bmm2=1.0,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        return_lse=False,
+        lse=None,
+        cu_seqlens=cu_seqlens,
+        skip_softmax_stat=True,
+    )
+
+    # Compute reference output for each sequence separately
+    o_ref = torch.zeros_like(o)
+    for i in range(batch_size):
+        start = cu_seqlens[i].item()
+        end = cu_seqlens[i + 1].item()
+
+        q_seq = q[start:end]  # [seq_len_i, num_heads, head_dim]
+        k_seq = k[start:end]
+        v_seq = v[start:end]
+
+        o_ref[start:end] = attention_ref_single(q_seq, k_seq, v_seq, causal=True, sm_scale=sm_scale)
+
+    o_ref = o_ref.to(o.dtype)
+
+    # Check results
+    rtol, atol = 1e-2, 1e-2
+    torch.testing.assert_close(o, o_ref, rtol=rtol, atol=atol)

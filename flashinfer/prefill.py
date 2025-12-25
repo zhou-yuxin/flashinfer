@@ -3455,33 +3455,44 @@ def fmha_v2_prefill_deepseek(
     out: torch.Tensor,
     num_heads: int,
     head_dim: int,
-    seq_len: int,
+    max_seqlen: int,
     scale_softmax: float,
     scale_bmm1: Optional[float] = None,
     scale_bmm2: Optional[float] = None,
     skip_softmax_threshold_scale_factor: float = 0.0,
     return_lse: bool = False,
     lse: Optional[torch.Tensor] = None,
+    skip_softmax_stat: bool = True,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     FMHA v2 prefill for DeepSeek with skip-softmax optimization.
 
+    Supports two modes:
+    - Padded mode (cu_seqlens is None): q/k/v shape [batch, seq_len, heads, dim]
+    - Varlen mode (cu_seqlens provided): q/k/v shape [total_tokens, heads, dim]
+
     Parameters
     ----------
     query : torch.Tensor
-        query tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        Padded mode: [batch_size, seq_len, num_heads, head_dim]
+        Varlen mode: [total_tokens, num_heads, head_dim]
     key : torch.Tensor
-        key tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        Padded mode: [batch_size, seq_len, num_kv_heads, head_dim]
+        Varlen mode: [total_tokens, num_kv_heads, head_dim]
     value : torch.Tensor
-        value tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        Padded mode: [batch_size, seq_len, num_kv_heads, head_dim_v]
+        Varlen mode: [total_tokens, num_kv_heads, head_dim_v]
     out : torch.Tensor
-        output tensor with shape [batch_size, seq_len, num_heads, head_dim]
+        Padded mode: [batch_size, seq_len, num_heads, head_dim_v]
+        Varlen mode: [total_tokens, num_heads, head_dim_v]
     num_heads : int
-        number of heads
+        number of query heads
     head_dim : int
-        head dimension
-    seq_len : int
-        sequence length
+        head dimension for Q/K
+    max_seqlen : int
+        Padded mode: sequence length
+        Varlen mode: max_seqlen (maximum sequence length in batch)
     scale_softmax : float
         scale for softmax
     scale_bmm1 : Optional[float]
@@ -3496,6 +3507,12 @@ def fmha_v2_prefill_deepseek(
         whether to return the log-sum-exp of attention output
     lse : Optional[torch.Tensor]
         log-sum-exp of attention output
+    skip_softmax_stat: bool
+        whether to collect statistics of skip-softmax optimization.
+    cu_seqlens : Optional[torch.Tensor]
+        cumulative sequence lengths for varlen mode, shape [batch_size + 1], dtype int32.
+        Example: [0, 128, 256, 512] for 3 sequences of lengths 128, 128, 256.
+        If None, uses padded mode.
 
     Returns
     -------
@@ -3505,7 +3522,7 @@ def fmha_v2_prefill_deepseek(
         the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    module = get_trtllm_fmha_v2_module(skip_softmax_stat=True)
+    module = get_trtllm_fmha_v2_module(skip_softmax_stat=skip_softmax_stat)
     is_e4m3 = query.dtype == torch.float8_e4m3fn
     is_bf16_output = out.dtype == torch.bfloat16
     scale_softmax = (
@@ -3513,6 +3530,14 @@ def fmha_v2_prefill_deepseek(
     )
     scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
     scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
+
+    # Handle cu_seqlens for varlen mode
+    if cu_seqlens is not None:
+        if cu_seqlens.dtype != torch.int32:
+            cu_seqlens = cu_seqlens.to(torch.int32)
+        if cu_seqlens.device != query.device:
+            cu_seqlens = cu_seqlens.to(query.device)
+
     module.run(
         query,
         key,
@@ -3521,13 +3546,14 @@ def fmha_v2_prefill_deepseek(
         lse,
         num_heads,
         head_dim,
-        seq_len,
+        max_seqlen,
         scale_softmax,
         scale_bmm1,
         scale_bmm2,
         is_e4m3,
         is_bf16_output,
         skip_softmax_threshold_scale_factor,
+        cu_seqlens,
     )
     if return_lse:
         return out, lse
