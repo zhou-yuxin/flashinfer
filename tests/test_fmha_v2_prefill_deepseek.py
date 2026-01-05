@@ -218,10 +218,20 @@ def attention_ref_single(
 
 
 @pytest.mark.parametrize("num_heads", [1, 4, 8])
-@pytest.mark.parametrize("head_dim_qk,head_dim_v", [(64, 64), (128, 128)])
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_v",
+    [
+        (64, 64),
+        (128, 128),
+        (192, 128),
+        (192, 192),
+        (256, 256),
+    ],
+)
 @pytest.mark.parametrize(
     "seq_lens",
     [
+        [8192, 8000, 10000],
         [1024, 2048, 4096],        # 3 sequences with different lengths
         [1024, 2048, 4096, 8192],  # 4 sequences
         [4096, 2048, 1024],        # decreasing lengths
@@ -286,4 +296,11 @@ def test_fmha_v2_prefill_deepseek_varlen(
 
     # Check results
     rtol, atol = 1e-2, 1e-2
-    torch.testing.assert_close(o, o_ref, rtol=rtol, atol=atol)
+    # torch.testing.assert_close(o, o_ref, rtol=rtol, atol=atol)
+    try:
+        torch.testing.assert_close(o, o_ref, rtol=rtol, atol=atol)
+    except AssertionError as e:
+        mask = ~torch.isclose(o, o_ref, rtol=rtol, atol=atol)
+        for (a, b) in zip(o[mask], o_ref[mask]):
+            print(float(a), float(b))
+        raise
