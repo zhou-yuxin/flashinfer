@@ -306,18 +306,20 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
                      int64_t seq_len, const double scale_softmax, const double scale_bmm1,
                      const double scale_bmm2, bool is_e4m3, bool is_bf16_output,
                      const double skip_softmax_threshold_scale_factor,
-                     std::optional<at::Tensor> maybe_cu_seqlens = std::nullopt) {
+                     std::optional<at::Tensor> maybe_cu_seqlens = std::nullopt,
+                     std::optional<at::Tensor> maybe_cu_kv_seqlens = std::nullopt) {
   // Determine if we're in varlen mode
   const bool is_varlen = maybe_cu_seqlens.has_value();
 
-  int batch_size, q_seqlen, kv_seqlen, total_tokens, num_kv_heads, head_dim_v;
+  int batch_size, q_seqlen, kv_seqlen, total_tokens, total_kv_tokens, num_kv_heads, head_dim_v;
 
   if (is_varlen) {
     // Varlen mode: q/k/v shape [total_tokens, num_heads, head_dim]
     batch_size = maybe_cu_seqlens.value().size(0) - 1;
     total_tokens = q.size(0);
+    total_kv_tokens = k.size(0);
     q_seqlen = seq_len;  // max_seqlen passed as seq_len parameter
-    kv_seqlen = seq_len;
+    kv_seqlen = 0;       // no need
     assert(num_heads == q.size(1) &&
            "num_heads must be equal to the number of heads in the query tensor");
     num_kv_heads = k.size(1);
@@ -330,6 +332,7 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
     q_seqlen = q.size(1);
     kv_seqlen = k.size(1);
     total_tokens = q_seqlen * batch_size;
+    total_kv_tokens = kv_seqlen * batch_size;;
     assert(num_heads == q.size(2) &&
            "num_heads must be equal to the number of heads in the query tensor");
     num_kv_heads = k.size(2);
@@ -341,7 +344,8 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
   Data_type data_type = is_e4m3 ? DATA_TYPE_E4M3 : DATA_TYPE_BF16;
   Data_type acc_type = DATA_TYPE_FP32;
   Data_type output_dtype = is_bf16_output ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
-  Attention_mask_type attention_mask_type = Attention_mask_type::CAUSAL;
+  // Attention_mask_type attention_mask_type = Attention_mask_type::CAUSAL;
+  Attention_mask_type attention_mask_type = Attention_mask_type::PADDING;
   Attention_input_layout input_layout = Attention_input_layout::SEPARATE_Q_K_V;
 
   CudaDevice device;
@@ -365,7 +369,7 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
                           props);
 
   launch_params.total_q_seqlen = total_tokens;
-  launch_params.total_kv_seqlen = total_tokens;
+  launch_params.total_kv_seqlen = total_kv_tokens;
   launch_params.enable_attn_logit_softcapping = false;
 
   // Static buffers for small fixed-size allocations to avoid repeated cudaMalloc/cudaFree.
@@ -384,10 +388,12 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
   FMHA_CHECK_CUDA(cudaMemsetAsync(tile_id_counter_d, 0, sizeof(uint32_t), stream));
 
   // Handle cumulative sequence lengths
-  void* cu_seqlens_d;
+  void *cu_seqlens_d, *cu_kv_seqlens_d;
   if (is_varlen) {
     // Varlen mode: use provided cu_seqlens directly
     cu_seqlens_d = maybe_cu_seqlens.value().data_ptr();
+    cu_kv_seqlens_d = maybe_cu_kv_seqlens.has_value() ?
+        maybe_cu_kv_seqlens.value().data_ptr() : cu_seqlens_d;
   } else {
     // Padded mode: cache cu_seqlens_d to avoid repeated cudaMalloc/cudaMemcpy
     // Only reallocate when batch_size or seq_len changes
@@ -445,8 +451,8 @@ void TRTLLMFMHAv2Run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
              nullptr,            // packed_mask_d (not used for causal)
              nullptr,            // cu_mask_rows_d (not used)
              nullptr,            // attention_sinks_d (not used)
-             cu_seqlens_d,       // cu_kv_seqlens_d
-             cu_seqlens_d,       // cu_q_seqlens_d (same as kv for equal lengths)
+             cu_kv_seqlens_d,    // cu_kv_seqlens_d
+             cu_seqlens_d,       // cu_q_seqlens_d
              o.data_ptr(),       // o_packed_d
              nullptr,            // p_d (not storing)
              nullptr,            // s_d (not storing)

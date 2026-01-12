@@ -3464,6 +3464,7 @@ def fmha_v2_prefill_deepseek(
     lse: Optional[torch.Tensor] = None,
     skip_softmax_stat: bool = True,
     cu_seqlens: Optional[torch.Tensor] = None,
+    cu_kv_seqlens: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     FMHA v2 prefill for DeepSeek with skip-softmax optimization.
@@ -3537,6 +3538,11 @@ def fmha_v2_prefill_deepseek(
             cu_seqlens = cu_seqlens.to(torch.int32)
         if cu_seqlens.device != query.device:
             cu_seqlens = cu_seqlens.to(query.device)
+    if cu_kv_seqlens is not None:
+        if cu_kv_seqlens.dtype != torch.int32:
+            cu_kv_seqlens = cu_kv_seqlens.to(torch.int32)
+        if cu_kv_seqlens.device != query.device:
+            cu_kv_seqlens = cu_kv_seqlens.to(query.device)
 
     module.run(
         query,
@@ -3554,6 +3560,7 @@ def fmha_v2_prefill_deepseek(
         is_bf16_output,
         skip_softmax_threshold_scale_factor,
         cu_seqlens,
+        cu_kv_seqlens
     )
     if return_lse:
         return out, lse
