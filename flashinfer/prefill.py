@@ -3447,23 +3447,181 @@ def trtllm_batch_context_with_kv_cache(
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
 
+# SGLang-compatible interface
+
+#===========================Stub==============================
+
+logger = logging.getLogger(__name__)
+
+def log_info_on_rank0(logger, message: str):
+    print(message)
+
+class ModelRunner:
+    
+    class ServerArgs:
+        def __init__(self):
+            self.skip_softmax_stat = True
+            self.skip_softmax_threshold_scale_factor = 0
+
+    class ModelConfig:
+        def __init__(self):
+            self.dtype = torch.bfloat16
+
+    def __init__(self):
+        self.device = "cuda"
+        self.server_args = self.ServerArgs()
+        self.model_config = self.ModelConfig()
+
+class ForwardBatch:
+    
+    class TokenToKVPool:
+        def set_kv_buffer(self, *args):
+            pass
+        
+    def __init__(self):
+        self.batch_size = 0
+        self.seq_lens = None
+        self.token_to_kv_pool = self.TokenToKVPool()
+        self.out_cache_loc = None
+
+class RadixAttention:
+    
+    def __init__(self):
+        self.tp_q_head_num = 1
+        self.tp_k_head_num = 1
+        self.tp_v_head_num = 1
+        self.head_dim = 1
+        self.qk_head_dim = 64
+        self.v_head_dim = 64
+        self.k_scale = 1
+        self.v_scale = 1
+        self.scaling = 1
+        self.layer_id = 0
+
+class AttentionBackend:
+    pass
+
+#===========================Implementation==============================
+
+class SkipSoftmaxBackend(AttentionBackend):
+    
+    INIT_MAX_BATCH_SIZE = 128
+    WORKSPACE_SIZE = 16
+    
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+    ) -> None:
+
+        super().__init__()
+        self.forward_metadata = None
+        # torch.ops.load_library('/sgl-workspace/sglang/trtllm_fmha_v2.so')
+        # self.module = torch.ops.trtllm_fmha_v2
+        self.module = get_trtllm_fmha_v2_module(skip_softmax_stat = model_runner.server_args.skip_softmax_stat)
+        self.skip_softmax_threshold_scale_factor = model_runner.server_args.skip_softmax_threshold_scale_factor
+        self.is_bf16_output = model_runner.model_config.dtype == torch.bfloat16
+        self.cu_seqlens = torch.zeros(self.INIT_MAX_BATCH_SIZE, dtype = torch.int32, device = model_runner.device)
+        self.workspace = torch.empty(self.WORKSPACE_SIZE, dtype = torch.uint8, device = model_runner.device)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        """Init auxiliary variables for triton attention backend."""
+        try:
+            self.skip_softmax_threshold_scale_factor = float(open('/sgl-workspace/sglang/skip_softmax_threshold_scale_factor').read())
+            log_info_on_rank0(logger, f'dynamic {self.skip_softmax_threshold_scale_factor=}')
+        except:
+            pass
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Init the global shared states for cuda graph."""
+        pass
+        
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ) -> torch.Tensor:
+
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        is_e4m3 = q.dtype == torch.float8_e4m3fn
+        is_bf16_output = self.is_bf16_output
+
+        # seq_len = q.size(0)
+        # q = q.contiguous().view(1, seq_len, layer.tp_q_head_num, layer.head_dim)
+        # k = k.contiguous().view(1, seq_len, layer.tp_k_head_num, layer.head_dim)
+        # v = v.contiguous().view(1, seq_len, layer.tp_v_head_num, layer.head_dim)
+        # o = torch.empty_like(q)
+        (head_num, head_num_kv) = (layer.tp_q_head_num, layer.tp_k_head_num)
+        (head_dim, head_dim_v) = (layer.qk_head_dim, layer.v_head_dim)
+        q = q.contiguous().view(-1, head_num, head_dim)
+        k = k.contiguous().view(-1, head_num_kv, head_dim)
+        v = v.contiguous().view(-1, head_num_kv, head_dim_v)
+        total_seqlen = q.size(0)
+        o = torch.empty((total_seqlen, head_num, head_dim_v),
+            dtype = torch.bfloat16 if is_bf16_output else q.dtype, device = q.device)
+        
+        batch_size = forward_batch.batch_size
+        # make sure self.cu_seqlens is big enough, expand if necessary.
+        # with a big enough INIT_MAX_BATCH_SIZE, this reallocation almost never happens.
+        if batch_size + 1 > self.cu_seqlens.numel():
+            # the minium power of 2 that >= b + 1
+            new_length = 1 << batch_size.bit_length()
+            self.cu_seqlens = torch.zeros(new_length, dtype = torch.int32, device = self.cu_seqlens.device)
+        assert(batch_size + 1 <= self.cu_seqlens.numel())
+        self.cu_seqlens[1: batch_size + 1] = torch.cumsum(forward_batch.seq_lens.to(self.cu_seqlens.device), dim=0)
+
+        seq_len = int(forward_batch.seq_lens.max())
+        scale_softmax = 0.0
+        scale_bmm1 = layer.scaling
+        scale_bmm2 = 1.0
+        skip_softmax_threshold_scale_factor = self.skip_softmax_threshold_scale_factor
+
+        if layer.layer_id == 0:
+            log_info_on_rank0(logger, f"{q.shape=} {k.shape=} {v.shape=} {o.shape=} "       \
+                f"{batch_size=} {seq_len=} {total_seqlen=} {head_num=} {head_num_kv=} "     \
+                f"{head_dim=} {head_dim_v=} {is_e4m3=} {is_bf16_output=} "                  \
+                f"{scale_softmax=} {scale_bmm1=} {scale_bmm2=} {skip_softmax_threshold_scale_factor=} " \
+                f"cu_seqlens={self.cu_seqlens[: batch_size + 1]}")
+    
+        self.module.run(q, k, v, o, None, self.cu_seqlens,
+            batch_size, seq_len, total_seqlen, total_seqlen, head_num, head_num_kv, head_dim, head_dim_v,
+            is_e4m3, is_bf16_output, True, scale_softmax, scale_bmm1, scale_bmm2,
+            skip_softmax_threshold_scale_factor, self.workspace)
+
+        # o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        raise Exception('unsupported now')
 
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    out: torch.Tensor,
     num_heads: int,
     head_dim: int,
-    max_seqlen: int,
+    head_dim_v: int,
     scale_softmax: float,
     scale_bmm1: Optional[float] = None,
     scale_bmm2: Optional[float] = None,
     skip_softmax_threshold_scale_factor: float = 0.0,
-    return_lse: bool = False,
-    lse: Optional[torch.Tensor] = None,
     skip_softmax_stat: bool = True,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     FMHA v2 prefill for DeepSeek with skip-softmax optimization.
@@ -3522,40 +3680,25 @@ def fmha_v2_prefill_deepseek(
         the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    module = get_trtllm_fmha_v2_module(skip_softmax_stat=skip_softmax_stat)
-    is_e4m3 = query.dtype == torch.float8_e4m3fn
-    is_bf16_output = out.dtype == torch.bfloat16
-    scale_softmax = (
-        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
-    )
-    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
-    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
+    model_runner = ModelRunner()
+    model_runner.server_args.skip_softmax_stat = skip_softmax_stat
+    model_runner.server_args.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor
+    model_runner.model_config.dtype = query.dtype
+    model_runner.device = query.device
+    skipsoft = SkipSoftmaxBackend(model_runner)
+    
+    layer = RadixAttention()
+    layer.tp_q_head_num = num_heads
+    layer.tp_k_head_num = num_heads
+    layer.tp_v_head_num = num_heads
+    layer.head_dim = head_dim
+    layer.qk_head_dim = head_dim
+    layer.v_head_dim = head_dim_v
+    layer.scaling = scale_bmm1
 
-    # Handle cu_seqlens for varlen mode
-    if cu_seqlens is not None:
-        if cu_seqlens.dtype != torch.int32:
-            cu_seqlens = cu_seqlens.to(torch.int32)
-        if cu_seqlens.device != query.device:
-            cu_seqlens = cu_seqlens.to(query.device)
+    forward_batch = ForwardBatch()
+    forward_batch.seq_lens = seq_lens
+    forward_batch.batch_size = seq_lens.numel()
 
-    module.run(
-        query,
-        key,
-        value,
-        out,
-        lse,
-        num_heads,
-        head_dim,
-        max_seqlen,
-        scale_softmax,
-        scale_bmm1,
-        scale_bmm2,
-        is_e4m3,
-        is_bf16_output,
-        skip_softmax_threshold_scale_factor,
-        cu_seqlens,
-    )
-    if return_lse:
-        return out, lse
-    else:
-        return out
+    o = skipsoft.forward_extend(query, key, value, layer, forward_batch)
+    return o
