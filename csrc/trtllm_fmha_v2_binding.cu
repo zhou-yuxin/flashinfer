@@ -230,8 +230,7 @@ static inline void determine_launch_params(
     bool const interleaved, bool const ignore_b1opt, bool const force_unroll, bool const use_tma,
     bool const force_non_flash_attention, bool const force_non_warp_specialization,
     bool const force_non_granular_tiling, bool const force_fp32_acc,
-    // device props
-    const cudaDeviceProp props) {
+    int multi_processor_count, int device_l2_cache_size) {
   // Set launch params to choose kernels
   launch_params.ignore_b1opt = ignore_b1opt;
   launch_params.force_unroll = force_unroll;
@@ -241,8 +240,8 @@ static inline void determine_launch_params(
   launch_params.attention_input_layout = input_layout;
 
   // Set SM count and L2 cache size (used to determine launch blocks/grids to maximum performance)
-  launch_params.multi_processor_count = props.multiProcessorCount;
-  launch_params.device_l2_cache_size = props.l2CacheSize;
+  launch_params.multi_processor_count = multi_processor_count;
+  launch_params.device_l2_cache_size = device_l2_cache_size;
 
   // threshold for adopting flash attention or warp_specialized kernels.
   launch_params.flash_attention =
@@ -309,6 +308,7 @@ void TRTLLMFMHAv2Run(const at::Tensor q, const at::Tensor k, const at::Tensor v,
                      bool is_e4m3, bool is_bf16_output, bool is_causal,
                      double scale_softmax, double scale_bmm1, double scale_bmm2,
                      double skip_softmax_threshold_scale_factor,
+                     int64_t sm, int64_t multi_processor_count, int64_t device_l2_cache_size,
                      at::Tensor workspace) {
 
   // allocate device-side variables
@@ -356,12 +356,8 @@ void TRTLLMFMHAv2Run(const at::Tensor q, const at::Tensor k, const at::Tensor v,
       Attention_mask_type::CAUSAL : Attention_mask_type::PADDING;
   Attention_input_layout input_layout = Attention_input_layout::SEPARATE_Q_K_V;
 
-  CudaDevice device;
-  int sm = device.sm;
-  cudaDeviceProp props = device.props;
-
   Launch_params launch_params;
-  determine_launch_params(launch_params, data_type, sm, s, d, attention_mask_type,
+  determine_launch_params(launch_params, data_type, int(sm), s, d, attention_mask_type,
                           input_layout,
                           false,  // interleaved
                           false,  // ignore_b1opt
@@ -371,7 +367,8 @@ void TRTLLMFMHAv2Run(const at::Tensor q, const at::Tensor k, const at::Tensor v,
                           false,   // force_non_warp_specialization (for non-SM90)
                           false,  // force_non_granular_tiling
                           true,   // force_fp32_acc
-                          props);
+                          int(multi_processor_count),
+                          int(device_l2_cache_size));
 
   launch_params.total_q_seqlen = total_seqlen;
   launch_params.total_kv_seqlen = totak_kv_seqlen;

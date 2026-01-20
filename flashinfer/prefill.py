@@ -3522,6 +3522,10 @@ class SkipSoftmaxBackend(AttentionBackend):
         self.is_bf16_output = model_runner.model_config.dtype == torch.bfloat16
         self.cu_seqlens = torch.zeros(self.INIT_MAX_BATCH_SIZE, dtype = torch.int32, device = model_runner.device)
         self.workspace = torch.empty(self.WORKSPACE_SIZE, dtype = torch.uint8, device = model_runner.device)
+        props = torch.cuda.get_device_properties(model_runner.device)
+        self.sm = props.major * 10 + props.minor
+        self.multi_processor_count = props.multi_processor_count
+        self.device_l2_cache_size = props.L2_cache_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -3592,8 +3596,10 @@ class SkipSoftmaxBackend(AttentionBackend):
     
         self.module.run(q, k, v, o, None, self.cu_seqlens,
             batch_size, seq_len, total_seqlen, total_seqlen, head_num, head_num_kv, head_dim, head_dim_v,
-            is_e4m3, is_bf16_output, True, scale_softmax, scale_bmm1, scale_bmm2,
-            skip_softmax_threshold_scale_factor, self.workspace)
+            is_e4m3, is_bf16_output, True,
+            scale_softmax, scale_bmm1, scale_bmm2, skip_softmax_threshold_scale_factor,
+            self.sm, self.multi_processor_count, self.device_l2_cache_size,
+            self.workspace)
 
         # o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return o
